@@ -781,6 +781,9 @@ def run_turboquant_calibration(
     ssh_user: str,
     copy_to: list[str] | None,
     dry_run: bool,
+    device: str = "auto",
+    batch_size: int = 4,
+    max_seq_len: int = 2048,
 ) -> bool:
     """
     Run the TurboQuant metadata generator inside the vllm container.
@@ -831,6 +834,9 @@ def run_turboquant_calibration(
             "--kv-cache-dtype", kv_dtype,
             "--prompts-file", "/tmp/turboquant_prompts.txt",
             "--output", container_output,
+            "--device", device,
+            "--batch-size", str(batch_size),
+            "--max-seq-len", str(max_seq_len),
         ]
 
         if dry_run:
@@ -839,6 +845,9 @@ def run_turboquant_calibration(
             print(f"  Model:             {model}")
             print(f"  Calibration model: {cal_model}")
             print(f"  KV dtype:          {kv_dtype}")
+            print(f"  Device:            {device}")
+            print(f"  Batch size:        {batch_size}")
+            print(f"  Max seq len:       {max_seq_len}")
             print(f"  Output:            {metadata_path}")
             if copy_to:
                 print(f"  Would copy to:     {', '.join(copy_to)}")
@@ -848,6 +857,9 @@ def run_turboquant_calibration(
         print(f"  Model:             {model}")
         print(f"  Calibration model: {cal_model}")
         print(f"  KV dtype:          {kv_dtype}")
+        print(f"  Device:            {device}")
+        print(f"  Batch size:        {batch_size}")
+        print(f"  Max seq len:       {max_seq_len}")
         print(f"  Output:            {metadata_path}")
 
         result = subprocess.run(cmd)
@@ -990,6 +1002,32 @@ Examples:
             "(required when the recipe model is a quantized checkpoint, e.g. FP8). "
             "Overrides the recipe's turboquant_calibration_model field."
         )
+    )
+    setup_group.add_argument(
+        "--turboquant-device",
+        dest="turboquant_device",
+        default="auto",
+        metavar="DEVICE",
+        help=(
+            "Device for TurboQuant calibration forward pass: 'auto', 'cuda', 'cpu', etc. "
+            "Use 'cpu' if the base model is too large for GPU memory (default: auto)."
+        )
+    )
+    setup_group.add_argument(
+        "--turboquant-batch-size",
+        dest="turboquant_batch_size",
+        type=int,
+        default=4,
+        metavar="N",
+        help="Batch size for TurboQuant calibration forward passes (default: 4). Reduce to lower peak memory."
+    )
+    setup_group.add_argument(
+        "--turboquant-max-seq-len",
+        dest="turboquant_max_seq_len",
+        type=int,
+        default=2048,
+        metavar="N",
+        help="Max sequence length for TurboQuant calibration (default: 2048). Reduce to lower peak memory."
     )
     
     parser.add_argument(
@@ -1317,6 +1355,9 @@ Examples:
                 if not run_turboquant_calibration(
                     container, model, cal_model, kv_dtype,
                     metadata_path, ssh_user, copy_targets, args.dry_run,
+                    device=args.turboquant_device,
+                    batch_size=args.turboquant_batch_size,
+                    max_seq_len=args.turboquant_max_seq_len,
                 ):
                     print("Error: TurboQuant calibration failed.")
                     return 1
