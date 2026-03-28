@@ -818,9 +818,11 @@ def run_turboquant_calibration(
         prompts_host_path = pf.name
 
     try:
+        tools_dir = SCRIPT_DIR / "tools"
         cmd = [
             "docker", "run", "--rm", "--gpus", "all",
             "-v", f"{hf_home}:{container_hf_home}",
+            "-v", f"{tools_dir}:/workspace/tools:ro",
             "-v", f"{prompts_host_path}:/tmp/turboquant_prompts.txt:ro",
             container,
             "python3", "/workspace/tools/generate_turboquant_metadata.py",
