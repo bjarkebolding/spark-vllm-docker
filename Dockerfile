@@ -240,7 +240,9 @@ ENV MAKEFLAGS="-j${BUILD_JOBS}"
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
-ENV VLLM_BASE_DIR=/workspace/vllm
+# ARG instead of ENV: only needed to compute TIKTOKEN_ENCODINGS_BASE and PATH
+# below; must not be set at runtime or vLLM will emit an "unknown env var" warning.
+ARG VLLM_BASE_DIR=/workspace/vllm
 
 # Set pip cache directory
 ENV PIP_CACHE_DIR=/root/.cache/pip
