@@ -140,21 +140,27 @@ WORKDIR $VLLM_BASE_DIR
 # --- VLLM SOURCE CACHE BUSTER ---
 ARG CACHEBUST_VLLM=1
 
+# Repository URL to clone vLLM from (default: upstream vllm-project/vllm)
+ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
+
 # Git reference (branch, tag, or SHA) to checkout
 ARG VLLM_REF=main
 
 # Smart Git Clone (Fetch changes instead of full re-clone)
+# NOTE: The repo-cache is keyed to "vllm" regardless of VLLM_REPO. If you switch
+# to a different fork, pass --build-arg CACHEBUST_VLLM=$(date +%s) to force a
+# fresh clone, otherwise the cached clone of the previous repo will be reused.
 RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
     cd /repo-cache && \
     if [ ! -d "vllm" ]; then \
-        echo "Cache miss: Cloning vLLM from scratch..." && \
-        git clone --recursive https://github.com/vllm-project/vllm.git; \
+        echo "Cache miss: Cloning vLLM from ${VLLM_REPO}..." && \
+        git clone --recursive ${VLLM_REPO} vllm; \
         if [ "$VLLM_REF" != "main" ]; then \
             cd vllm && \
             git checkout ${VLLM_REF}; \
         fi; \
     else \
-        echo "Cache hit: Fetching updates..." && \
+        echo "Cache hit: Fetching updates from origin..." && \
         cd vllm && \
         git fetch origin && \
         git fetch origin --tags --force && \
