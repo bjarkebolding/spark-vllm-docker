@@ -85,6 +85,7 @@ RELATED FILES:
 
 import argparse
 import os
+import re as _re
 import subprocess
 import shlex
 import sys
@@ -180,6 +181,10 @@ def load_recipe(recipe_path: Path) -> dict[str, Any]:
     recipe.setdefault("env", {})
     recipe.setdefault("cluster_only", False)
     recipe.setdefault("solo_only", False)
+    # Optional: non-quantized base model to use for TurboQuant calibration when
+    # the serving model is a quantized checkpoint (e.g. FP8). Without this, the
+    # auto-calibration step will fail on quantized models.
+    recipe.setdefault("turboquant_calibration_model", None)
     
     # Validate recipe version compatibility
     # EXTENSIBILITY: When adding new schema versions, update SUPPORTED_VERSIONS
@@ -700,6 +705,170 @@ def run_autodiscover() -> dict[str, str] | None:
     return env
 
 
+# Default prompts used for TurboQuant calibration when no prompts file is given.
+# These cover a range of domain styles so the channel-score statistics are
+# representative of typical LLM workloads.
+_TURBOQUANT_DEFAULT_PROMPTS = [
+    "The attention mechanism in transformer models computes",
+    "Large language models are trained on diverse datasets including",
+    "The key difference between supervised and unsupervised learning is",
+    "Neural networks consist of layers of interconnected nodes that",
+    "The transformer architecture revolutionized natural language processing by",
+    "Quantization reduces model size by representing weights with fewer bits",
+    "The capital of France is Paris, which is also known for",
+    "Machine learning algorithms learn patterns from data to make",
+    "The gradient descent algorithm minimizes loss functions by iteratively",
+    "Convolutional neural networks are particularly effective for image recognition because",
+    "Reinforcement learning trains agents to maximize cumulative reward through",
+    "The softmax function converts raw scores into probability distributions",
+    "Tokenization splits text into subword units for language model input",
+    "Memory bandwidth is a key bottleneck for large language model inference",
+    "The key-value cache stores intermediate attention computations to speed up",
+    "Mixture of experts models route tokens to specialized sub-networks for",
+    "Write a Python function that computes the Fibonacci sequence",
+    "Explain the difference between TCP and UDP protocols",
+    "The French Revolution began in 1789 when",
+    "In quantum mechanics, the wave function describes",
+    "To solve a system of linear equations you can use",
+    "The human genome contains approximately three billion base pairs that",
+    "Climate change is driven primarily by greenhouse gas emissions from",
+    "The time complexity of merge sort is O(n log n) because",
+    "Docker containers differ from virtual machines in that",
+    "The Pythagorean theorem states that in a right triangle",
+    "Photosynthesis is the process by which plants convert",
+    "The Federal Reserve controls monetary policy by adjusting",
+    "SQL joins combine rows from two or more tables based on",
+    "The speed of light in a vacuum is approximately",
+    "HTTPS encrypts web traffic using TLS to protect",
+    "A hash table achieves O(1) average lookup time by",
+]
+
+
+def _detect_turboquant_dtype(recipe: dict[str, Any]) -> str | None:
+    """Return the turboquant kv-cache dtype if the recipe uses one, else None."""
+    m = _re.search(r'--kv-cache-dtype\s+(turboquant\w+)', recipe.get("command", ""))
+    return m.group(1) if m else None
+
+
+def _model_snapshot_dir(model: str) -> Path | None:
+    """Return the most-recently-modified snapshot directory for a cached HF model."""
+    hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+    cache_name = f"models--{model.replace('/', '--')}"
+    snapshots_dir = hf_home / "hub" / cache_name / "snapshots"
+    if not snapshots_dir.exists():
+        return None
+    snapshots = sorted(snapshots_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+    return snapshots[0] if snapshots else None
+
+
+def _turboquant_metadata_path(model: str) -> Path | None:
+    """Return the path where turboquant_kv.json should be placed for a model."""
+    snap = _model_snapshot_dir(model)
+    return (snap / "turboquant_kv.json") if snap else None
+
+
+def _turboquant_metadata_exists(model: str) -> bool:
+    path = _turboquant_metadata_path(model)
+    return path is not None and path.exists()
+
+
+def run_turboquant_calibration(
+    container: str,
+    model: str,
+    calibration_model: str | None,
+    kv_dtype: str,
+    metadata_path: Path,
+    ssh_user: str,
+    copy_to: list[str] | None,
+    dry_run: bool,
+) -> bool:
+    """
+    Run the TurboQuant metadata generator inside the vllm container.
+
+    The generator script (/workspace/tools/generate_turboquant_metadata.py) is
+    baked into the image during build. It runs a short calibration forward pass
+    through the (non-quantized) model to determine which KV-cache channels have
+    high activation energy and should be kept at higher precision.
+
+    Args:
+        container:         Docker image tag to run the generator in.
+        model:             HF model ID being served (used for shape derivation).
+        calibration_model: Non-quantized base model for activation collection.
+                           Required when model is a quantized checkpoint (e.g. FP8).
+                           Falls back to model if None (works for non-quantized models).
+        kv_dtype:          TurboQuant recipe, e.g. 'turboquant35'.
+        metadata_path:     Host-side output path for turboquant_kv.json.
+        ssh_user:          SSH username used when rsyncing metadata to worker nodes.
+        copy_to:           Worker hostnames to rsync the metadata file to after generation.
+        dry_run:           If True, print the command without executing.
+
+    Returns:
+        True on success, False on failure.
+    """
+    hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+    # Map host HF cache path into the container (mounted at /root/.cache/huggingface)
+    container_hf_home = "/root/.cache/huggingface"
+    container_output = container_hf_home + str(metadata_path)[len(str(hf_home)):]
+
+    cal_model = calibration_model or model
+
+    # Write default calibration prompts to a temp file and mount it read-only
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as pf:
+        pf.write("\n".join(_TURBOQUANT_DEFAULT_PROMPTS))
+        prompts_host_path = pf.name
+
+    try:
+        cmd = [
+            "docker", "run", "--rm", "--gpus", "all",
+            "-v", f"{hf_home}:{container_hf_home}",
+            "-v", f"{prompts_host_path}:/tmp/turboquant_prompts.txt:ro",
+            container,
+            "python3", "/workspace/tools/generate_turboquant_metadata.py",
+            "--model", model,
+            "--calibration-model", cal_model,
+            "--kv-cache-dtype", kv_dtype,
+            "--prompts-file", "/tmp/turboquant_prompts.txt",
+            "--output", container_output,
+        ]
+
+        if dry_run:
+            print(f"Would generate TurboQuant metadata:")
+            print(f"  Container:         {container}")
+            print(f"  Model:             {model}")
+            print(f"  Calibration model: {cal_model}")
+            print(f"  KV dtype:          {kv_dtype}")
+            print(f"  Output:            {metadata_path}")
+            if copy_to:
+                print(f"  Would copy to:     {', '.join(copy_to)}")
+            return True
+
+        print(f"Generating TurboQuant metadata (this may take several minutes)...")
+        print(f"  Model:             {model}")
+        print(f"  Calibration model: {cal_model}")
+        print(f"  KV dtype:          {kv_dtype}")
+        print(f"  Output:            {metadata_path}")
+
+        result = subprocess.run(cmd)
+        if result.returncode != 0:
+            print("Error: TurboQuant calibration failed.")
+            return False
+
+        # Rsync the metadata file to cluster worker nodes
+        if copy_to and metadata_path.exists():
+            for host in copy_to:
+                dest = f"{ssh_user}@{host}:{metadata_path}"
+                print(f"Copying turboquant_kv.json to {host}...")
+                subprocess.run(["rsync", "-av", str(metadata_path), dest])
+
+        return True
+
+    finally:
+        try:
+            os.unlink(prompts_host_path)
+        except OSError:
+            pass
+
+
 def main():
     """
     Main entry point for the recipe runner.
@@ -797,6 +966,28 @@ Examples:
         "--force-download",
         action="store_true",
         help="Force re-download even if model exists"
+    )
+    setup_group.add_argument(
+        "--skip-turboquant-calibration",
+        action="store_true",
+        dest="skip_turboquant_calibration",
+        help="Skip automatic TurboQuant metadata generation even if turboquant_kv.json is missing"
+    )
+    setup_group.add_argument(
+        "--force-turboquant-calibration",
+        action="store_true",
+        dest="force_turboquant_calibration",
+        help="Force regeneration of TurboQuant metadata even if turboquant_kv.json already exists"
+    )
+    setup_group.add_argument(
+        "--turboquant-calibration-model",
+        dest="turboquant_calibration_model",
+        metavar="MODEL",
+        help=(
+            "Non-quantized base model to use for TurboQuant calibration "
+            "(required when the recipe model is a quantized checkpoint, e.g. FP8). "
+            "Overrides the recipe's turboquant_calibration_model field."
+        )
     )
     
     parser.add_argument(
@@ -1085,7 +1276,53 @@ Examples:
         if args.download_only:
             print("Download complete." if not args.dry_run else "")
             return 0
-    
+
+    # --- TurboQuant Calibration Phase ---
+    # Auto-runs whenever the recipe uses a turboquant kv-cache dtype and
+    # turboquant_kv.json is absent from the model's HF cache snapshot directory.
+    # Skipped if --skip-turboquant-calibration is set or the recipe has no model field.
+    kv_dtype = _detect_turboquant_dtype(recipe)
+    if kv_dtype and model and not args.skip_turboquant_calibration:
+        force_cal = args.force_turboquant_calibration
+        cal_model = (
+            args.turboquant_calibration_model
+            or recipe.get("turboquant_calibration_model")
+        )
+        metadata_path = _turboquant_metadata_path(model)
+        needs_calibration = force_cal or not _turboquant_metadata_exists(model)
+
+        if args.dry_run:
+            if needs_calibration:
+                print(f"Would generate TurboQuant metadata for '{model}' ({kv_dtype})")
+                if cal_model:
+                    print(f"  Calibration model: {cal_model}")
+                if not _turboquant_metadata_exists(model):
+                    print(f"  (turboquant_kv.json not found in model cache)")
+            else:
+                print(f"TurboQuant metadata already exists for '{model}' — skipping calibration.")
+            print()
+        elif needs_calibration:
+            print("=== TurboQuant Calibration ===")
+            if metadata_path is None:
+                print(
+                    f"Warning: model '{model}' not found in HF cache — "
+                    "skipping TurboQuant calibration.\n"
+                    "  Download the model first (--setup or --download-only)."
+                )
+                print()
+            else:
+                ssh_user = os.environ.get("USER", "root")
+                if not run_turboquant_calibration(
+                    container, model, cal_model, kv_dtype,
+                    metadata_path, ssh_user, copy_targets, args.dry_run,
+                ):
+                    print("Error: TurboQuant calibration failed.")
+                    return 1
+                print()
+        else:
+            print(f"TurboQuant metadata already exists for '{model}'.")
+            print()
+
     # --- Run Phase ---
     if args.build_only or args.download_only:
         return 0
