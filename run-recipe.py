@@ -101,6 +101,8 @@ except ImportError:
 
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
+# Container-side tools directory — must match `COPY tools/ /workspace/tools/` in Dockerfile
+CONTAINER_TOOLS_DIR = "/workspace/tools"
 RECIPES_DIR = SCRIPT_DIR / "recipes"
 LAUNCH_SCRIPT = SCRIPT_DIR / "launch-cluster.sh"
 BUILD_SCRIPT = SCRIPT_DIR / "build-and-copy.sh"
@@ -788,7 +790,7 @@ def run_turboquant_calibration(
     """
     Run the TurboQuant metadata generator inside the vllm container.
 
-    The generator script (/workspace/tools/generate_turboquant_metadata.py) is
+    The generator script ({CONTAINER_TOOLS_DIR}/generate_turboquant_metadata.py) is
     baked into the image during build. It runs a short calibration forward pass
     through the (non-quantized) model to determine which KV-cache channels have
     high activation energy and should be kept at higher precision.
@@ -825,10 +827,10 @@ def run_turboquant_calibration(
         cmd = [
             "docker", "run", "--rm", "--gpus", "all",
             "-v", f"{hf_home}:{container_hf_home}",
-            "-v", f"{tools_dir}:/workspace/tools:ro",
+            "-v", f"{tools_dir}:{CONTAINER_TOOLS_DIR}:ro",
             "-v", f"{prompts_host_path}:/tmp/turboquant_prompts.txt:ro",
             container,
-            "python3", "/workspace/tools/generate_turboquant_metadata.py",
+            "python3", f"{CONTAINER_TOOLS_DIR}/generate_turboquant_metadata.py",
             "--model", model,
             "--calibration-model", cal_model,
             "--kv-cache-dtype", kv_dtype,
