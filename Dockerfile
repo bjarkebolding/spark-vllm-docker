@@ -310,8 +310,8 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
 # TORCH_CUDA_ARCH_LIST=12.1a is already set above.
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     --mount=type=cache,id=ccache,target=/root/.ccache \
-    uv pip install causal-conv1d && \
-    uv pip install flash-linear-attention
+    uv pip install --no-build-isolation causal-conv1d && \
+    uv pip install --no-build-isolation flash-linear-attention
 
 # TurboQuant calibration tools
 COPY tools/ /workspace/tools/
