@@ -86,6 +86,7 @@ RELATED FILES:
 import argparse
 import os
 import re as _re
+import shlex as _shlex
 import subprocess
 import shlex
 import sys
@@ -824,13 +825,10 @@ def run_turboquant_calibration(
 
     try:
         tools_dir = SCRIPT_DIR / "tools"
-        cmd = [
-            "docker", "run", "--rm", "--gpus", "all",
-            "-v", f"{hf_home}:{container_hf_home}",
-            "-v", f"{tools_dir}:{CONTAINER_TOOLS_DIR}:ro",
-            "-v", f"{prompts_host_path}:/tmp/turboquant_prompts.txt:ro",
-            container,
-            "python3", f"{CONTAINER_TOOLS_DIR}/generate_turboquant_metadata.py",
+        # Build the python invocation as a quoted shell string so we can
+        # prepend a transformers upgrade (qwen3_5_moe and other new archs
+        # may not be recognized by the pinned version in the image).
+        script_args = [
             "--model", model,
             "--calibration-model", cal_model,
             "--kv-cache-dtype", kv_dtype,
@@ -839,6 +837,19 @@ def run_turboquant_calibration(
             "--device", device,
             "--batch-size", str(batch_size),
             "--max-seq-len", str(max_seq_len),
+        ]
+        script_cmd = " ".join(
+            ["python3", f"{CONTAINER_TOOLS_DIR}/generate_turboquant_metadata.py"]
+            + [_shlex.quote(a) for a in script_args]
+        )
+        cmd = [
+            "docker", "run", "--rm", "--gpus", "all",
+            "-v", f"{hf_home}:{container_hf_home}",
+            "-v", f"{tools_dir}:{CONTAINER_TOOLS_DIR}:ro",
+            "-v", f"{prompts_host_path}:/tmp/turboquant_prompts.txt:ro",
+            container,
+            "sh", "-c",
+            f"uv pip install -q -U transformers && {script_cmd}",
         ]
 
         if dry_run:
