@@ -21,6 +21,7 @@ While it was primarily developed to support multi-node inference, it works just 
 - [9. Fastsafetensors](#9-fastsafetensors)
 - [10. Benchmarking](#10-benchmarking)
 - [11. Downloading Models](#11-downloading-models)
+- [12. TurboQuant KV Cache](#12-turboquant-kv-cache)
 
 ## DISCLAIMER
 
@@ -148,6 +149,43 @@ docker builder prune
 Don't do it every time you rebuild, because it will slow down compilation times.
 
 For periodic maintenance, I recommend using a filter: `docker builder prune --filter until=72h`
+
+### 2026-03-29
+
+#### TurboQuant KV Cache Support
+
+Added full TurboQuant KV cache support for NVIDIA GB10 / DGX Spark, including automated calibration, metadata injection, and two ready-to-use recipes.
+
+TurboQuant is a mixed-precision KV cache quantization scheme developed specifically for the GB10 architecture. It delivers higher quality KV cache compression than plain `fp8` by using activation-calibrated per-layer high-precision channels. See [Section 12](#12-turboquant-kv-cache) for complete documentation.
+
+**New recipes:**
+- `qwen3-coder-next-fp8-tq` — Qwen3-Coder-Next-FP8 with `turboquant35` KV cache
+- `qwen3.5-35b-a3b-fp8-tq` — Qwen3.5-35B-A3B-FP8 with `turboquant35` KV cache
+
+```bash
+./run-recipe.sh qwen3-coder-next-fp8-tq --setup
+./run-recipe.sh qwen3.5-35b-a3b-fp8-tq --setup
+```
+
+#### `--vllm-repo` Parameter in `build-and-copy.sh`
+
+Added `--vllm-repo <url>` to allow building vLLM from any fork instead of the default `vllm-project/vllm`:
+
+```bash
+./build-and-copy.sh --vllm-repo https://github.com/mitkox/vllm-turboquant
+```
+
+Automatically forces `--rebuild-vllm`. Incompatible with `--exp-mxfp4`. See the [build options table](#using-the-build-script) for details.
+
+> **Note:** The Docker build cache keys the vLLM clone by the directory name `vllm`, not by the repo URL. If you switch between forks, pass `--build-arg CACHEBUST_VLLM=$(date +%s)` or simply use `--vllm-repo` which handles this automatically.
+
+#### `causal-conv1d` and `flash-linear-attention` in Runner Image
+
+Added `causal-conv1d` and `flash-linear-attention` to the runner Docker image. These libraries provide fast CUDA kernels for GDN / linear-attention layers used in hybrid models like Qwen3-Coder-Next and Qwen3.5-35B-A3B. Without them, generation falls back to slow PyTorch (~5 t/s). Both packages are compiled from source during the Docker build since no pre-built wheels exist for SM121 (GB10). `build-essential` and `ninja-build` are now included in the runner stage to support this.
+
+#### Dockerfile: Suppress `VLLM_BASE_DIR` Runtime Warning
+
+Changed `VLLM_BASE_DIR` from `ENV` to `ARG` in the runner stage of both `Dockerfile` and `Dockerfile.mxfp4`. This eliminates the spurious `Unknown vLLM environment variable detected: VLLM_BASE_DIR` warning that appeared in vLLM logs at startup.
 
 ### 2026-03-18
 
@@ -889,6 +927,7 @@ Using a different username:
 | `--gpu-arch <arch>` | Target GPU architecture (default: `12.1a`) |
 | `--rebuild-flashinfer` | Skip prebuilt wheel download; force a fresh local FlashInfer build |
 | `--rebuild-vllm` | Force rebuild vLLM from source |
+| `--vllm-repo <url>` | vLLM repository URL (default: `vllm-project/vllm`). Forces `--rebuild-vllm`. Incompatible with `--exp-mxfp4`. |
 | `--vllm-ref <ref>` | vLLM commit SHA, branch or tag (default: `main`) |
 | `--apply-vllm-pr <pr-num>` | Apply a vLLM PR patch during build. Can be specified multiple times. |
 | `--tf5` | Install transformers v5 (5.0.0 or higher). Aliases: `--pre-tf, --pre-transformers`. |
@@ -1325,3 +1364,111 @@ The `hf-download.sh` script provides a convenient way to download models from Hu
 ### Hardware Architecture
 
 **Note:** This project targets `12.1a` architecture (NVIDIA GB10 / DGX Spark). If you are using different hardware, you can use `--gpu-arch` flag in `./build-and-copy.sh`.
+
+---
+
+## 12\. TurboQuant KV Cache
+
+TurboQuant is a mixed-precision KV cache quantization scheme designed specifically for the NVIDIA GB10 (DGX Spark / SM121) architecture. It uses activation-calibrated, per-layer high-precision channel indices to achieve better generation quality than a plain `fp8` KV cache at comparable memory savings.
+
+Two variants are available:
+- `turboquant25` — lighter compression
+- `turboquant35` — heavier compression (recommended for most use cases)
+
+TurboQuant requires the `triton_attn` attention backend. It is **not** supported by FlashInfer.
+
+### How it works
+
+1. Before the first serve, `run-recipe.py` runs a calibration forward pass on the base (non-quantized) model using a set of representative prompts.
+2. The calibration produces a `turboquant_kv.json` file that records which KV channels to keep at high precision for each layer.
+3. This file is stored inside the model's HuggingFace cache snapshot directory so it persists across container restarts.
+4. At serve time, the metadata path is automatically injected into the vLLM command via `--turboquant-metadata-path`.
+
+### Using a TurboQuant recipe
+
+The quickest way is via `run-recipe.sh`:
+
+```bash
+# Full setup: build image, download models, calibrate, and serve
+./run-recipe.sh qwen3-coder-next-fp8-tq --setup
+
+# If calibration OOMs with GPU (e.g. for large base models), use CPU offload
+./run-recipe.sh qwen3-coder-next-fp8-tq --setup \
+  --turboquant-device cpu --turboquant-batch-size 1
+
+# Skip calibration if turboquant_kv.json already exists
+./run-recipe.sh qwen3-coder-next-fp8-tq
+
+# Force re-calibration even if metadata already exists
+./run-recipe.sh qwen3-coder-next-fp8-tq --force-turboquant-calibration
+```
+
+### Writing a TurboQuant recipe
+
+Add these fields to a standard recipe YAML:
+
+```yaml
+# FP8 quantized model to serve
+model: Qwen/Qwen3-Coder-Next-FP8
+
+# Non-quantized base model used for calibration
+# Must be the FP16/BF16 base, not the quantized variant
+turboquant_calibration_model: Qwen/Qwen3-Coder-Next
+
+command: |
+  vllm serve Qwen/Qwen3-Coder-Next-FP8 \
+    --kv-cache-dtype turboquant35 \
+    --enable-turboquant \
+    --attention-backend triton_attn \
+    ...
+```
+
+> **Important:** The calibration model must be the non-quantized base. Running calibration against the FP8 model itself produces incorrect metadata.
+
+### TurboQuant calibration flags (`run-recipe.sh`)
+
+| Flag | Default | Description |
+| :--- | :--- | :--- |
+| `--skip-turboquant-calibration` | — | Never run calibration, even if metadata is missing |
+| `--force-turboquant-calibration` | — | Always re-run calibration, even if metadata exists |
+| `--turboquant-calibration-model MODEL` | from recipe | Override the calibration model |
+| `--turboquant-device DEVICE` | `auto` | Device for calibration (`auto`, `cuda`, `cpu`). Use `cpu` if GPU OOMs during calibration |
+| `--turboquant-batch-size N` | `4` | Batch size for calibration. Reduce to `1` with `--turboquant-device cpu` |
+| `--turboquant-max-seq-len N` | `2048` | Maximum sequence length during calibration |
+
+### Metadata storage and path injection
+
+The generated `turboquant_kv.json` is written into the model's HuggingFace snapshot directory:
+
+```
+~/.cache/huggingface/hub/models--ORG--MODEL/snapshots/<hash>/turboquant_kv.json
+```
+
+At launch time, `run-recipe.py` automatically maps this host path to the container-side HuggingFace cache mount and injects `--turboquant-metadata-path` into the vLLM command. No manual path configuration is needed.
+
+### Available TurboQuant recipes
+
+| Recipe | Model | Calibration model |
+| :--- | :--- | :--- |
+| `qwen3-coder-next-fp8-tq` | `Qwen/Qwen3-Coder-Next-FP8` | `Qwen/Qwen3-Coder-Next` |
+| `qwen3.5-35b-a3b-fp8-tq` | `Qwen/Qwen3.5-35B-A3B-FP8` | `Qwen/Qwen3.5-35B-A3B` |
+
+### Troubleshooting TurboQuant
+
+**`TurboQuant KV cache requires metadata`**
+The `turboquant_kv.json` file is missing. Run with `--setup` to trigger calibration, or check that the metadata file exists at the path shown in the error.
+
+**`Unknown attention backend: 'TRITON'`**
+The correct backend name is `triton_attn` (lowercase with underscore), not `TRITON`.
+
+**`FlashInfer kv_cache_dtype not supported`**
+TurboQuant is not compatible with FlashInfer. Set `--attention-backend triton_attn`.
+
+**`block_size must be <= max_num_batched_tokens`**
+Hybrid models (e.g. Qwen3-Coder-Next) with Mamba/GDN layers require a larger block size. Add `--max-num-batched-tokens 4096` (or higher) to the recipe command. The `qwen3-coder-next-fp8-tq` recipe already includes this.
+
+**Calibration OOM (no traceback, process killed)**
+The base model is too large to fit in GPU memory during calibration. Use `--turboquant-device cpu --turboquant-batch-size 1`. Note that `cpu` device is **not** available for models with `causal_conv1d` layers (e.g. Qwen3.5-35B-A3B) — use `--turboquant-device auto` for those models, which spreads across all available GPUs via `device_map="auto"`.
+
+**`qwen3_5_moe` architecture not recognized**
+The transformers version in the image is too old for this model. The calibration script automatically upgrades transformers inside the container before running; pull the latest image to get this fix.
