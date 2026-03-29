@@ -1397,6 +1397,20 @@ Examples:
     # In solo mode, default tensor_parallel to 1 (unless user explicitly set --tp)
     if is_solo and "tensor_parallel" not in overrides:
         overrides["tensor_parallel"] = 1
+
+    # Inject --turboquant-metadata-path if the recipe uses turboquant and the
+    # metadata file exists. The container mounts $HF_HOME at /root/.cache/huggingface
+    # (see launch-cluster.sh), so we map the host path to the container path.
+    # Only inject if the user hasn't already supplied the flag themselves.
+    if kv_dtype and not any("turboquant-metadata-path" in a for a in extra_args):
+        tq_meta = _turboquant_metadata_path(model) if model else None
+        if tq_meta and tq_meta.exists():
+            hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+            container_meta = "/root/.cache/huggingface" + str(tq_meta)[len(str(hf_home)):]
+            extra_args = list(extra_args) + ["--turboquant-metadata-path", container_meta]
+            if not args.dry_run:
+                print(f"TurboQuant metadata: {container_meta} (inside container)")
+                print()
     
     # Check for duplicate arguments (warn if extra_args duplicate CLI overrides)
     if extra_args:
