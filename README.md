@@ -172,7 +172,11 @@ TurboQuant is a mixed-precision KV cache quantization scheme developed specifica
 Added `--vllm-repo <url>` to allow building vLLM from any fork instead of the default `vllm-project/vllm`:
 
 ```bash
+# Original TurboQuant vLLM fork by mitkox
 ./build-and-copy.sh --vllm-repo https://github.com/mitkox/vllm-turboquant
+
+# Community fork with additional fixes
+./build-and-copy.sh --vllm-repo https://github.com/bjarkebolding/vllm-turboquant
 ```
 
 Automatically forces `--rebuild-vllm`. Incompatible with `--exp-mxfp4`. See the [build options table](#using-the-build-script) for details.
@@ -1376,6 +1380,16 @@ Two variants are available:
 - `turboquant35` — heavier compression (recommended for most use cases)
 
 TurboQuant requires the `triton_attn` attention backend. It is **not** supported by FlashInfer.
+
+To build vLLM with a TurboQuant fork:
+
+```bash
+# Original TurboQuant vLLM fork by mitkox
+./build-and-copy.sh --vllm-repo https://github.com/mitkox/vllm-turboquant
+
+# Community fork with additional fixes
+./build-and-copy.sh --vllm-repo https://github.com/bjarkebolding/vllm-turboquant
+```
 
 ### How it works
 
