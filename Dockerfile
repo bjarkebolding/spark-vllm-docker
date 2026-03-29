@@ -252,12 +252,15 @@ ENV UV_BREAK_SYSTEM_PACKAGES=1
 ENV UV_LINK_MODE=copy
 
 # Install runtime dependencies
+# build-essential + ninja-build are needed to compile causal-conv1d and
+# flash-linear-attention from source (no pre-built wheels exist for SM121).
 RUN apt update && \
     apt install -y --no-install-recommends \
     python3 python3-pip python3-dev vim curl git wget \
     libcudnn9-cuda-13 \
     libnccl-dev libnccl2 libibverbs1 libibverbs-dev rdma-core \
     libxcb1 \
+    build-essential ninja-build \
     && rm -rf /var/lib/apt/lists/* \
     && pip install uv
 
@@ -300,6 +303,15 @@ ENV PATH=$VLLM_BASE_DIR:$PATH
 # Final extra deps
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     uv pip install ray[default] fastsafetensors
+
+# Install causal-conv1d and flash-linear-attention for Qwen3-Next hybrid models
+# (GDN/linear attention layers fall back to slow PyTorch without these).
+# No pre-built wheels exist for SM121 — both packages compile from source;
+# TORCH_CUDA_ARCH_LIST=12.1a is already set above.
+RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
+    --mount=type=cache,id=ccache,target=/root/.ccache \
+    uv pip install causal-conv1d && \
+    uv pip install flash-linear-attention
 
 # TurboQuant calibration tools
 COPY tools/ /workspace/tools/
